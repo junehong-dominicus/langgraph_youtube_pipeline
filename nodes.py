@@ -1,6 +1,6 @@
 import logging
 from typing import Any, Dict
-from .state import VideoState
+from state import VideoState
 
 logger = logging.getLogger(__name__)
 

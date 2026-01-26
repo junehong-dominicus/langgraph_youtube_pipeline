@@ -1,5 +1,5 @@
 import pytest
-from langgraph_youtube_pipeline.graph import app
+from graph import app
 
 def test_pipeline_execution_long(default_state):
     """Test full execution of the long-form pipeline."""
