@@ -15,8 +15,7 @@ logger = logging.getLogger(__name__)
 
 if __name__ == "__main__":
     try:
-        # from langgraph_youtube_pipeline.graph import app
-        from graph import app
+        from langgraph_youtube_pipeline.graph import app
     except ImportError as e:
         logger.error(f"Failed to import application: {e}")
         logger.error("Ensure directory is named 'langgraph_youtube_pipeline' and run with 'python -m langgraph_youtube_pipeline.main'")

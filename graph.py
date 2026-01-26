@@ -1,7 +1,11 @@
 from typing import Literal, List
 from langgraph.graph import StateGraph, END
-from state import VideoState
-from nodes import *
+try:
+    from state import VideoState
+    from nodes import *
+except ImportError:
+    from .state import VideoState
+    from .nodes import *
 
 def route_content_type(state: VideoState) -> List[str]:
     """

@@ -1,6 +1,9 @@
 import logging
 from typing import Any, Dict
-from state import VideoState
+try:
+    from state import VideoState
+except ImportError:
+    from .state import VideoState
 
 logger = logging.getLogger(__name__)
 
