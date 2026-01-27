@@ -1,5 +1,5 @@
 import pytest
-from langgraph_youtube_pipeline.graph import app
+from graph import app
 
 # --- Integration Tests: Graph Execution ---
 

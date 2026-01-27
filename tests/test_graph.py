@@ -1,5 +1,5 @@
 import pytest
-from langgraph_youtube_pipeline.graph import route_content_type, should_retry, app
+from graph import route_content_type, should_retry, app
 
 def test_app_compilation():
     """Test that the app is compiled and ready for execution."""

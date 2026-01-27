@@ -1,5 +1,5 @@
 import pytest
-from langgraph_youtube_pipeline.state import replace_reducer, VideoState
+from state import replace_reducer, VideoState
 
 def test_replace_reducer():
     """Test the reducer used for error updates."""

@@ -1,5 +1,5 @@
 import pytest
-from langgraph_youtube_pipeline.nodes import (
+from nodes import (
     topic_planner,
     content_type_router,
     script_generator,
