@@ -1,4 +1,9 @@
 import pytest
+import sys
+import os
+
+# Ensure parent directory is in path to import state module
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from state import replace_reducer, VideoState
 
 def test_replace_reducer():

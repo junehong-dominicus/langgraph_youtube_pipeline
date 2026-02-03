@@ -22,13 +22,16 @@ def route_content_type(state: VideoState) -> List[str]:
         return ["script_generator", "short_script_generator"]
     return ["script_generator"]
 
-def should_retry(state: VideoState) -> Literal["retry", "next"]:
+def should_retry(state: VideoState) -> Literal["retry", "fallback", "next"]:
     """
     Section 11.1: Retry logic based on error state.
     """
-    # Check if error exists and we haven't exceeded max retries (e.g., 2)
-    if state.get("error") and state.get("retry_count", 0) < 2:
-        return "retry"
+    # Check if error exists
+    if state.get("error"):
+        # Check if we haven't exceeded max retries (e.g., 2)
+        if state.get("retry_count", 0) < 2:
+            return "retry"
+        return "fallback"
     return "next"
 
 
@@ -41,10 +44,12 @@ workflow.add_node("content_type_router", content_type_router)
 
 # Long Form Nodes
 workflow.add_node("script_generator", script_generator)
+workflow.add_node("script_generator_fallback", script_generator_fallback)
 workflow.add_node("voice_generator", voice_generator)
 workflow.add_node("asset_generator", asset_generator)
 workflow.add_node("video_composer", video_composer)
 workflow.add_node("metadata_generator", metadata_generator)
+workflow.add_node("thumbnail_generator", thumbnail_generator)
 workflow.add_node("youtube_upload", youtube_upload)
 
 # Short Form Nodes
@@ -73,13 +78,15 @@ workflow.add_conditional_edges(
 workflow.add_conditional_edges(
     "script_generator",
     should_retry,
-    {"retry": "script_generator", "next": "voice_generator"}
+    {"retry": "script_generator", "fallback": "script_generator_fallback", "next": "voice_generator"}
 )
 
+workflow.add_edge("script_generator_fallback", "voice_generator")
 workflow.add_edge("voice_generator", "asset_generator")
 workflow.add_edge("asset_generator", "video_composer")
 workflow.add_edge("video_composer", "metadata_generator")
-workflow.add_edge("metadata_generator", "youtube_upload")
+workflow.add_edge("metadata_generator", "thumbnail_generator")
+workflow.add_edge("thumbnail_generator", "youtube_upload")
 workflow.add_edge("youtube_upload", END)
 
 # Short Form Pipeline Flow

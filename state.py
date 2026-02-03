@@ -1,5 +1,4 @@
 from typing import TypedDict, Optional, List, Literal, Annotated
-import operator
 
 def replace_reducer(a, b):
     return b
@@ -20,6 +19,7 @@ class VideoState(TypedDict):
     title: Optional[str]
     description: Optional[str]
     tags: Optional[List[str]]
+    thumbnail_path: Optional[str]
     upload_status: Optional[str]
     
     # Short-form Artifacts

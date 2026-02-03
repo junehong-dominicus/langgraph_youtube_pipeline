@@ -37,6 +37,13 @@ def test_route_content_type_default():
     result = route_content_type(state)
     assert result == ["script_generator"]
 
+def test_route_content_type_unknown():
+    """Test routing for unknown content type defaults to long."""
+    state = {"content_type": "vr_experience"}
+    # Should default to long form path
+    result = route_content_type(state)
+    assert result == ["script_generator"]
+
 # --- Retry Logic Tests ---
 
 def test_should_retry_logic_no_error():
@@ -49,8 +56,23 @@ def test_should_retry_logic_retry():
     assert should_retry({"error": "Error", "retry_count": 0}) == "retry"
     assert should_retry({"error": "Error", "retry_count": 1}) == "retry"
 
+def test_should_retry_logic_missing_count():
+    """Test retry logic when retry_count is missing from state."""
+    # Should default to 0 and retry
+    assert should_retry({"error": "Error"}) == "retry"
+
 def test_should_retry_logic_max_retries():
     """Test retry logic when max retries reached."""
-    # Limit is < 2, so 2 should fail/proceed to next
-    assert should_retry({"error": "Error", "retry_count": 2}) == "next"
-    assert should_retry({"error": "Error", "retry_count": 3}) == "next"
+    # Limit is < 2, so 2 should route to fallback
+    assert should_retry({"error": "Error", "retry_count": 2}) == "fallback"
+    assert should_retry({"error": "Error", "retry_count": 3}) == "fallback"
+
+def test_should_retry_logic_simulated_api_failure():
+    """Test retry logic with a simulated API failure message."""
+    state = {"error": "OpenAI API ConnectionTimeout", "retry_count": 0}
+    assert should_retry(state) == "retry"
+
+def test_should_retry_logic_empty_error():
+    """Test retry logic when error is present but empty string."""
+    state = {"error": "", "retry_count": 0}
+    assert should_retry(state) == "next"
