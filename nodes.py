@@ -2,6 +2,7 @@ import logging
 import base64
 import os
 import re
+import openai
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -15,19 +16,131 @@ from googleapiclient.http import MediaFileUpload
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
-try:
-    from state import VideoState
-except ImportError:
+
+if __package__:
     from .state import VideoState
+    from .config import PipelineConfig
+else:
+    from state import VideoState
+    from config import PipelineConfig
 
 logger = logging.getLogger(__name__)
 
-# --- Core Logic Nodes ---
+# --- Helper Functions ---
+
+def _get_llm(model="gpt-4o", temperature=0.7):
+    # Disable internal retries to allow Graph control flow to handle errors immediately
+    return ChatOpenAI(model=model, temperature=temperature, max_retries=0)
+
+def _generate_script_content(topic: str, system_prompt: str, user_prompt_fmt: str = "Topic: {topic}") -> str:
+    llm = _get_llm()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", user_prompt_fmt)
+    ])
+    chain = prompt | llm | StrOutputParser()
+    return chain.invoke({"topic": topic})
+
+def _generate_audio_file(script: str, output_filename: str) -> str:
+    client = OpenAI(max_retries=0)
+    # Remove visual cues
+    clean_script = re.sub(r'\[.*?\]', '', script).strip()
+    
+    os.makedirs("output", exist_ok=True)
+    output_path = os.path.join("output", output_filename)
+
+    response = client.audio.speech.create(
+        model="tts-1",
+        voice="alloy",
+        input=clean_script[:4096]
+    )
+    response.stream_to_file(output_path)
+    return output_path
+
+def _generate_image_prompts(script: str, system_prompt: str) -> list[str]:
+    llm = _get_llm()
+    prompt_generator = ChatPromptTemplate.from_messages([
+        ("system", system_prompt),
+        ("user", "Script: {script}")
+    ])
+    chain = prompt_generator | llm | StrOutputParser()
+    prompts_text = chain.invoke({"script": script[:4000]})
+    return [p.strip() for p in prompts_text.split('\n') if p.strip()][:3]
+
+def _generate_images(prompts: list[str], size: str, output_prefix: str) -> list[str]:
+    client = OpenAI(max_retries=0)
+    os.makedirs("output", exist_ok=True)
+    image_paths = []
+
+    for i, img_prompt in enumerate(prompts):
+        logger.info(f"Generating image {i+1} for {output_prefix}...")
+        response = client.images.generate(
+            model="dall-e-3",
+            prompt=img_prompt,
+            size=size,
+            quality="standard",
+            n=1,
+            response_format="b64_json"
+        )
+        image_data = base64.b64decode(response.data[0].b64_json)
+        file_path = os.path.join("output", f"{output_prefix}_{i}.png")
+        with open(file_path, "wb") as f:
+            f.write(image_data)
+        image_paths.append(file_path)
+    return image_paths
+
+def _compose_video_file(voice_path: str, image_paths: list[str], output_filename: str, width: int, height: int, fps: int) -> str:
+    audio_clip = AudioFileClip(voice_path)
+    img_duration = audio_clip.duration / len(image_paths)
+    
+    clips = []
+    for img_path in image_paths:
+        clip = ImageClip(img_path).set_duration(img_duration)
+        
+        # Resize logic: fit height, then handle width (crop or pad)
+        clip = clip.resize(height=height)
+        
+        if clip.w > width:
+            # Crop center
+            clip = clip.crop(x_center=clip.w / 2, width=width)
+        elif clip.w < width:
+            # Pad (Pillarbox)
+            margin_left = int((width - clip.w) // 2)
+            margin_right = int(width - clip.w - margin_left)
+            clip = clip.margin(left=margin_left, right=margin_right, color=(0,0,0))
+            
+        clips.append(clip)
+        
+    final_clip = concatenate_videoclips(clips, method="compose")
+    final_clip = final_clip.set_audio(audio_clip)
+    
+    os.makedirs("output", exist_ok=True)
+    output_path = os.path.join("output", output_filename)
+    final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=fps, logger=None)
+    return output_path
+
+def _handle_api_error(e: Exception, state: VideoState, node_name: str) -> VideoState:
+    """Centralized error handling for API calls to provide more intelligent retry behavior."""
+    logger.error(f"Error in {node_name}: {e}")
+    
+    # Check for non-retriable OpenAI errors
+    if isinstance(e, openai.APIStatusError):
+        # Quota errors or auth errors should not be retried
+        if e.status_code == 429 and 'insufficient_quota' in str(e).lower():
+            logger.warning("Non-retriable error (insufficient_quota). Bypassing retries to trigger fallback/end.")
+            # Set retry_count to max to trigger fallback/end immediately
+            return {"error": str(e), "retry_count": PipelineConfig.MAX_RETRIES} 
+        if e.status_code in [401, 403]: # Unauthorized, Forbidden
+            logger.warning(f"Non-retriable error (HTTP {e.status_code}). Bypassing retries to fallback/end.")
+            return {"error": str(e), "retry_count": PipelineConfig.MAX_RETRIES}
+
+    # For other errors, increment retry count normally
+    return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
+
 
 def topic_planner(state: VideoState) -> VideoState:
     """Section 10.3: Validate or select the topic."""
     logger.info("--- Topic Planner ---")
-    # Ensure a topic exists, fallback to default if empty or None
     topic = state.get("topic") or "Default AI Topic"
     return {"topic": topic}
 
@@ -58,11 +171,7 @@ def script_generator(state: VideoState) -> VideoState:
         return {"error": "No topic provided."}
 
     try:
-        # Initialize LLM
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are a professional YouTube scriptwriter. Create an engaging 3-5 minute video script.
+        system_prompt = """You are a professional YouTube scriptwriter. Create an engaging 3-5 minute video script.
 
 Structure:
 1. Hook (0:00-0:30): Grab attention immediately.
@@ -70,17 +179,12 @@ Structure:
 3. Main Body: Cover 3-4 key points in depth.
 4. Conclusion & CTA: Summarize and ask to subscribe.
 
-Format: Use [Visual] tags for visual cues and write the narration clearly."""),
-            ("user", "Topic: {topic}")
-        ])
-
-        chain = prompt | llm | StrOutputParser()
-        script = chain.invoke({"topic": topic})
+Format: Use [Visual] tags for visual cues and write the narration clearly."""
         
-        return {"script": script, "error": None}
+        script = _generate_script_content(topic, system_prompt)
+        return {"script": script, "error": None, "retry_count": 0}
     except Exception as e:
-        logger.error(f"Script generation failed: {e}")
-        return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
+        return _handle_api_error(e, state, "script_generator")
 
 def script_generator_fallback(state: VideoState) -> VideoState:
     """Fallback logic if script generation fails repeatedly."""
@@ -93,7 +197,7 @@ def script_generator_fallback(state: VideoState) -> VideoState:
         "We will be diving deeper into this in future videos. "
         "Thanks for watching and don't forget to subscribe!"
     )
-    return {"script": script, "error": None}
+    return {"script": script, "error": None, "retry_count": 0}
 
 def voice_generator(state: VideoState) -> VideoState:
     """Section 10.5: TTS for long-form."""
@@ -104,27 +208,10 @@ def voice_generator(state: VideoState) -> VideoState:
         return {"error": "No script provided."}
 
     try:
-        client = OpenAI()
-        
-        # Remove visual cues like [Visual: ...] for TTS
-        clean_script = re.sub(r'\[.*?\]', '', script).strip()
-        
-        # Ensure output directory exists
-        os.makedirs("output", exist_ok=True)
-        output_path = os.path.join("output", "long_voice.mp3")
-
-        response = client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=clean_script[:4096]  # Limit for single request
-        )
-        
-        response.stream_to_file(output_path)
-        
-        return {"voice_path": output_path, "error": None}
+        output_path = _generate_audio_file(script, "long_voice.mp3")
+        return {"voice_path": output_path, "error": None, "retry_count": 0}
     except Exception as e:
-        logger.error(f"Voice generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "voice_generator")
 
 def asset_generator(state: VideoState) -> VideoState:
     """Section 10.6: Visual assets for long-form."""
@@ -134,51 +221,18 @@ def asset_generator(state: VideoState) -> VideoState:
     if not script:
         return {"error": "No script provided."}
 
-    image_paths = []
-    
     try:
-        # 1. Generate Image Prompts using LLM
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
-        prompt_generator = ChatPromptTemplate.from_messages([
-            ("system", """You are an AI visual director. 
+        system_prompt = """You are an AI visual director. 
 Based on the provided video script, create exactly 3 distinct, detailed image generation prompts for DALL-E 3.
 One for the beginning, one for the middle, and one for the end.
-Return ONLY the 3 prompts, separated by newlines. Do not number them."""),
-            ("user", "Script: {script}")
-        ])
+Return ONLY the 3 prompts, separated by newlines. Do not number them."""
         
-        chain = prompt_generator | llm | StrOutputParser()
-        prompts_text = chain.invoke({"script": script[:4000]})
-        prompts = [p.strip() for p in prompts_text.split('\n') if p.strip()][:3]
-
-        client = OpenAI()
-        os.makedirs("output", exist_ok=True)
-
-        # 2. Generate Images
-        for i, img_prompt in enumerate(prompts):
-            logger.info(f"Generating image {i+1}: {img_prompt[:50]}...")
-            response = client.images.generate(
-                model="dall-e-3",
-                prompt=img_prompt,
-                size="1024x1024",
-                quality="standard",
-                n=1,
-                response_format="b64_json"
-            )
-            
-            image_data = base64.b64decode(response.data[0].b64_json)
-            file_path = os.path.join("output", f"image_{i}.png")
-            
-            with open(file_path, "wb") as f:
-                f.write(image_data)
-            
-            image_paths.append(file_path)
-            
-        return {"image_paths": image_paths, "error": None}
+        prompts = _generate_image_prompts(script, system_prompt)
+        image_paths = _generate_images(prompts, "1024x1024", "image")
+        return {"image_paths": image_paths, "error": None, "retry_count": 0}
 
     except Exception as e:
-        logger.error(f"Asset generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "asset_generator")
 
 def video_composer(state: VideoState) -> VideoState:
     """Section 10.7: Compose long-form video."""
@@ -191,30 +245,13 @@ def video_composer(state: VideoState) -> VideoState:
         return {"error": "Missing voice or images for video composition."}
         
     try:
-        audio_clip = AudioFileClip(voice_path)
-        # Calculate duration per image
-        img_duration = audio_clip.duration / len(image_paths)
-        
-        clips = []
-        for img_path in image_paths:
-            clip = ImageClip(img_path).set_duration(img_duration).resize(height=1080)
-            # Center on 1920x1080 canvas
-            margin_left = (1920 - clip.w) // 2
-            margin_right = 1920 - clip.w - margin_left
-            clip = clip.margin(left=margin_left, right=margin_right, color=(0,0,0))
-            clips.append(clip)
-            
-        final_clip = concatenate_videoclips(clips, method="compose")
-        final_clip = final_clip.set_audio(audio_clip)
-        
-        os.makedirs("output", exist_ok=True)
-        output_path = os.path.join("output", "final_video.mp4")
-        final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=24, logger=None)
-        
-        return {"video_path": output_path, "error": None}
+        output_path = _compose_video_file(
+            voice_path, image_paths, "final_video.mp4", width=1920, height=1080, fps=24
+        )
+        return {"video_path": output_path, "error": None, "retry_count": 0}
     except Exception as e:
         logger.error(f"Video composition failed: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
 
 def metadata_generator(state: VideoState) -> VideoState:
     """Section 10.8: Generate metadata."""
@@ -227,7 +264,7 @@ def metadata_generator(state: VideoState) -> VideoState:
         return {"error": "Missing topic or script for metadata generation."}
 
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+        llm = _get_llm()
         
         prompt = ChatPromptTemplate.from_messages([
             ("system", """You are a YouTube SEO expert. Generate metadata for a video based on the script.
@@ -248,15 +285,15 @@ Return a valid JSON object with exactly these keys:
             "title": result.get("title"),
             "description": result.get("description"),
             "tags": result.get("tags"),
-            "error": None
+            "error": None,
+            "retry_count": 0
         }
         
     except Exception as e:
-        logger.error(f"Metadata generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "metadata_generator")
 
 def thumbnail_generator(state: VideoState) -> VideoState:
-    """Section 10.8.5: Generate thumbnail."""
+    """Section 10.8.5: Generate thumbnail. (Specific to Long-form)"""
     logger.info("--- Thumbnail Generator ---")
     
     topic = state.get("topic")
@@ -266,8 +303,8 @@ def thumbnail_generator(state: VideoState) -> VideoState:
         return {"error": "No topic provided for thumbnail."}
 
     try:
-        # 1. Generate Prompt
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
+        # 1. Generate Prompt (Custom logic, keep explicit)
+        llm = _get_llm()
         prompt = ChatPromptTemplate.from_messages([
             ("system", "You are a YouTube thumbnail designer. Create a detailed prompt for DALL-E 3 to generate a high-CTR thumbnail. Focus on visual elements, high contrast, and emotion. Do not include the prompt for text overlays, just the visual scene."),
             ("user", "Topic: {topic}\nVideo Title: {title}")
@@ -275,8 +312,8 @@ def thumbnail_generator(state: VideoState) -> VideoState:
         chain = prompt | llm | StrOutputParser()
         img_prompt = chain.invoke({"topic": topic, "title": title})
 
-        # 2. Generate Image
-        client = OpenAI()
+        # 2. Generate Image (16:9)
+        client = OpenAI(max_retries=0)
         os.makedirs("output", exist_ok=True)
         
         response = client.images.generate(
@@ -293,10 +330,9 @@ def thumbnail_generator(state: VideoState) -> VideoState:
         with open(output_path, "wb") as f:
             f.write(image_data)
             
-        return {"thumbnail_path": output_path, "error": None}
+        return {"thumbnail_path": output_path, "error": None, "retry_count": 0}
     except Exception as e:
-        logger.error(f"Thumbnail generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "thumbnail_generator")
 
 def _get_youtube_service():
     """Helper to authenticate and return YouTube service."""
@@ -376,11 +412,11 @@ def youtube_upload(state: VideoState) -> VideoState:
                 media_body=MediaFileUpload(thumbnail_path)
             ).execute()
             
-        return {"upload_status": "success", "error": None}
+        return {"upload_status": "success", "error": None, "retry_count": 0}
         
     except Exception as e:
         logger.error(f"YouTube upload failed: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
 
 # --- Short Form Pipeline Nodes (Section 12) ---
 
@@ -393,11 +429,7 @@ def short_script_generator(state: VideoState) -> VideoState:
         return {"error": "No topic provided."}
 
     try:
-        # Initialize LLM
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """You are an expert YouTube Shorts scriptwriter. Create a high-energy, viral script under 60 seconds.
+        system_prompt = """You are an expert YouTube Shorts scriptwriter. Create a high-energy, viral script under 60 seconds.
 
 Structure:
 1. Hook (0-3s): Stop the scroll immediately.
@@ -407,17 +439,12 @@ Structure:
 Format:
 - Keep sentences short.
 - Use [Visual] tags for visual cues.
-- Total word count should be around 130-150 words for normal speaking pace."""),
-            ("user", "Topic: {topic}")
-        ])
+- Total word count should be around 130-150 words for normal speaking pace."""
 
-        chain = prompt | llm | StrOutputParser()
-        script = chain.invoke({"topic": topic})
-        
-        return {"short_script": script, "error": None}
+        script = _generate_script_content(topic, system_prompt)
+        return {"short_script": script, "error": None, "retry_count": 0}
     except Exception as e:
-        logger.error(f"Short script generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "short_script_generator")
 
 def short_voice_generator(state: VideoState) -> VideoState:
     """Implied by 12.4: TTS for shorts."""
@@ -428,27 +455,10 @@ def short_voice_generator(state: VideoState) -> VideoState:
         return {"error": "No short script provided."}
 
     try:
-        client = OpenAI()
-        
-        # Remove visual cues like [Visual: ...] for TTS
-        clean_script = re.sub(r'\[.*?\]', '', script).strip()
-        
-        # Ensure output directory exists
-        os.makedirs("output", exist_ok=True)
-        output_path = os.path.join("output", "short_voice.mp3")
-
-        response = client.audio.speech.create(
-            model="tts-1",
-            voice="alloy",
-            input=clean_script[:4096]
-        )
-        
-        response.stream_to_file(output_path)
-        
-        return {"short_voice_path": output_path, "error": None}
+        output_path = _generate_audio_file(script, "short_voice.mp3")
+        return {"short_voice_path": output_path, "error": None, "retry_count": 0}
     except Exception as e:
-        logger.error(f"Short voice generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "short_voice_generator")
 
 def short_asset_generator(state: VideoState) -> VideoState:
     """Implied by 12.4: Assets for shorts."""
@@ -458,52 +468,19 @@ def short_asset_generator(state: VideoState) -> VideoState:
     if not script:
         return {"error": "No short script provided."}
 
-    image_paths = []
-    
     try:
-        # 1. Generate Image Prompts using LLM
-        llm = ChatOpenAI(model="gpt-4o", temperature=0.7)
-        prompt_generator = ChatPromptTemplate.from_messages([
-            ("system", """You are an AI visual director for YouTube Shorts. 
+        system_prompt = """You are an AI visual director for YouTube Shorts. 
 Based on the provided video script, create exactly 3 distinct, detailed image generation prompts for DALL-E 3.
 The images will be generated in vertical format (9:16), so focus on central composition and verticality.
 One for the beginning, one for the middle, and one for the end.
-Return ONLY the 3 prompts, separated by newlines. Do not number them."""),
-            ("user", "Script: {script}")
-        ])
-        
-        chain = prompt_generator | llm | StrOutputParser()
-        prompts_text = chain.invoke({"script": script[:4000]})
-        prompts = [p.strip() for p in prompts_text.split('\n') if p.strip()][:3]
+Return ONLY the 3 prompts, separated by newlines. Do not number them."""
 
-        client = OpenAI()
-        os.makedirs("output", exist_ok=True)
-
-        # 2. Generate Images
-        for i, img_prompt in enumerate(prompts):
-            logger.info(f"Generating short image {i+1}: {img_prompt[:50]}...")
-            response = client.images.generate(
-                model="dall-e-3",
-                prompt=img_prompt,
-                size="1024x1792",  # Vertical for Shorts
-                quality="standard",
-                n=1,
-                response_format="b64_json"
-            )
-            
-            image_data = base64.b64decode(response.data[0].b64_json)
-            file_path = os.path.join("output", f"short_image_{i}.png")
-            
-            with open(file_path, "wb") as f:
-                f.write(image_data)
-            
-            image_paths.append(file_path)
-            
-        return {"short_image_paths": image_paths, "error": None}
+        prompts = _generate_image_prompts(script, system_prompt)
+        image_paths = _generate_images(prompts, "1024x1792", "short_image")
+        return {"short_image_paths": image_paths, "error": None, "retry_count": 0}
 
     except Exception as e:
-        logger.error(f"Short asset generation failed: {e}")
-        return {"error": str(e)}
+        return _handle_api_error(e, state, "short_asset_generator")
 
 def short_video_composer(state: VideoState) -> VideoState:
     """Section 12.4: Compose shorts video (9:16)."""
@@ -516,39 +493,13 @@ def short_video_composer(state: VideoState) -> VideoState:
         return {"error": "Missing voice or images for shorts composition."}
         
     try:
-        audio_clip = AudioFileClip(voice_path)
-        # Calculate duration per image
-        img_duration = audio_clip.duration / len(image_paths)
-        
-        clips = []
-        for img_path in image_paths:
-            clip = ImageClip(img_path).set_duration(img_duration)
-            
-            # Resize to fill 1080x1920 (Vertical)
-            # Strategy: Resize height to 1920, then center crop width to 1080
-            clip = clip.resize(height=1920)
-            
-            if clip.w > 1080:
-                clip = clip.crop(x_center=clip.w / 2, width=1080)
-            elif clip.w < 1080:
-                # Fallback: pad if somehow narrower
-                margin_left = int((1080 - clip.w) // 2)
-                margin_right = int(1080 - clip.w - margin_left)
-                clip = clip.margin(left=margin_left, right=margin_right, color=(0,0,0))
-                
-            clips.append(clip)
-            
-        final_clip = concatenate_videoclips(clips, method="compose")
-        final_clip = final_clip.set_audio(audio_clip)
-        
-        os.makedirs("output", exist_ok=True)
-        output_path = os.path.join("output", "short_video.mp4")
-        final_clip.write_videofile(output_path, codec="libx264", audio_codec="aac", fps=30, logger=None)
-        
-        return {"short_video_path": output_path, "error": None}
+        output_path = _compose_video_file(
+            voice_path, image_paths, "short_video.mp4", width=1080, height=1920, fps=30
+        )
+        return {"short_video_path": output_path, "error": None, "retry_count": 0}
     except Exception as e:
         logger.error(f"Short video composition failed: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
 
 def short_metadata_generator(state: VideoState) -> VideoState:
     """Section 12.5: Shorts metadata."""
@@ -602,8 +553,8 @@ def short_youtube_upload(state: VideoState) -> VideoState:
                 logger.info(f"Uploaded Short {int(status.progress() * 100)}%")
                 
         logger.info(f"Short Upload Complete! Video ID: {response.get('id')}")
-        return {"short_upload_status": "success", "error": None}
+        return {"short_upload_status": "success", "error": None, "retry_count": 0}
         
     except Exception as e:
         logger.error(f"YouTube short upload failed: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "retry_count": state.get("retry_count", 0) + 1}
